@@ -10,9 +10,13 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QLabel,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
+    QHBoxLayout,
 )
+from qtpy.QtCore import Qt
+from qtpy.QtGui import QKeyEvent
 
 
 class LazyVideoLoader:
@@ -114,6 +118,9 @@ class VideoLoaderWidget(QWidget):
         self.info_label = QLabel("Drag & drop video file or click button to load")
         layout.addWidget(self.info_label)
         
+        # Enable keyboard focus for arrow key navigation
+        self.setFocusPolicy(Qt.StrongFocus)
+        
     def load_video(self):
         """Load video using file dialog."""
         path, _ = QFileDialog.getOpenFileName(
@@ -153,26 +160,34 @@ class VideoLoaderWidget(QWidget):
             
             print(f"Video: {video_shape}, dtype={video_dtype}, frames={num_frames}")
             
-            # Determine if color
-            is_color = len(video_shape) == 4
-            if is_color:
-                height, width, channels = video_shape[1], video_shape[2], video_shape[3]
+            # Assume grayscale video (user specified)
+            # Handle both grayscale and color, but treat as grayscale
+            if len(video_shape) == 4:
+                # Color video - convert to grayscale
+                height, width = video_shape[1], video_shape[2]
+                channels = video_shape[3]
+                print(f"Note: Color video detected ({channels} channels), will display as grayscale")
             else:
+                # Grayscale
                 height, width = video_shape[1], video_shape[2]
                 channels = 1
             
             # Load ONLY the first frame to create the layer
-            # This is the ONLY frame that will be in memory initially
             first_frame = self.video_loader.get_frame(0)
             
-            # Create a single-frame array for Napari
-            # We'll update this array when the slider moves
-            if is_color:
-                # For color, we create a single time point: (1, H, W, C)
-                initial_data = first_frame[np.newaxis, ...]  # Add time dimension
-            else:
-                # Grayscale: (1, H, W)
-                initial_data = first_frame[np.newaxis, ...]
+            # Convert to grayscale if needed
+            if len(first_frame.shape) == 3:
+                # Color frame - convert to grayscale
+                first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+            
+            # Verify frame is grayscale
+            if len(first_frame.shape) != 2:
+                raise ValueError(f"Expected grayscale frame (H, W), got shape: {first_frame.shape}")
+            
+            print(f"First frame shape: {first_frame.shape}, dtype: {first_frame.dtype}, min={first_frame.min()}, max={first_frame.max()}")
+            
+            # Create single-frame grayscale array: (1, H, W)
+            initial_data = first_frame[np.newaxis, ...]
             
             # Remove old layer
             try:
@@ -183,47 +198,40 @@ class VideoLoaderWidget(QWidget):
             
             # Store video metadata
             self.num_frames = num_frames
-            self.is_color = is_color
             self.video_dtype = video_dtype
             self.height = height
             self.width = width
-            self.channels = channels
             
-            # MEMORY-EFFICIENT APPROACH: Don't create full array!
-            # Instead, create a minimal array and use a custom update mechanism
-            # We'll create a small buffer (e.g., 3 frames) and update it dynamically
-            
-            # Calculate memory per frame
-            if is_color:
-                bytes_per_frame = height * width * channels * np.dtype(video_dtype).itemsize
-                full_array_size = num_frames * bytes_per_frame / (1024**3)  # GB
-            else:
-                bytes_per_frame = height * width * np.dtype(video_dtype).itemsize
-                full_array_size = num_frames * bytes_per_frame / (1024**3)  # GB
+            # Calculate memory per frame (grayscale)
+            bytes_per_frame = height * width * np.dtype(video_dtype).itemsize
+            full_array_size = num_frames * bytes_per_frame / (1024**3)  # GB
             
             print(f"Video size if fully loaded: {full_array_size:.2f} GB")
             if full_array_size > 1.0:
                 print(f"WARNING: Full video would use {full_array_size:.2f} GB - using lazy loading")
             
-            # CRITICAL: Don't create full array! Only create single-frame array
-            # We'll update it dynamically when user navigates frames
-            # This prevents allocating 60GB of memory
-            
-            if is_color:
-                # Single frame array: (1, H, W, C) - minimal memory
-                video_array = first_frame[np.newaxis, ...].copy()
-            else:
-                # Single frame: (1, H, W)
-                video_array = first_frame[np.newaxis, ...].copy()
+            # Single frame grayscale array: (1, H, W)
+            video_array = initial_data.copy()
             
             # Add layer with SINGLE frame only
-            # Note: Don't use channel_axis - it returns a list of layers
-            # Instead, add as RGB/RGBA image directly
-            add_kwargs = {'name': 'video'}
-            add_kwargs['contrast_limits'] = [0, 255] if video_dtype == np.uint8 else None
+            # For grayscale, we add as 2D image (H, W) - Napari handles this better
+            # Remove time dimension for initial display
+            video_array_2d = video_array[0]  # Shape: (H, W)
             
-            # Add the image layer
-            layer_result = self.viewer.add_image(video_array, **add_kwargs)
+            add_kwargs = {'name': 'video'}
+            # Set contrast limits based on actual data
+            data_min = float(video_array_2d.min())
+            data_max = float(video_array_2d.max())
+            if data_max > data_min:
+                add_kwargs['contrast_limits'] = (data_min, data_max)
+            elif video_dtype == np.uint8:
+                add_kwargs['contrast_limits'] = (0, 255)
+            
+            # Add the image layer as 2D (H, W) - Napari displays this better
+            layer_result = self.viewer.add_image(video_array_2d, **add_kwargs)
+            
+            # Store the 2D shape for later updates
+            self.video_shape_2d = video_array_2d.shape
             
             # Napari's add_image can return either a single layer or a list
             # Get the actual layer from the viewer's layers collection to be safe
@@ -242,34 +250,50 @@ class VideoLoaderWidget(QWidget):
             if not hasattr(self.video_layer, 'data'):
                 raise ValueError(f"Video layer is not a valid layer: {type(self.video_layer)}")
             
-            print(f"Video layer created: {type(self.video_layer)}, data shape: {self.video_layer.data.shape}")
+            # Configure layer
+            self.video_layer.visible = True
+            self.video_layer.opacity = 1.0
+            data_min = float(video_array_2d.min())
+            data_max = float(video_array_2d.max())
+            if data_max > data_min:
+                self.video_layer.contrast_limits = (data_min, data_max)
             
-            # Add frame navigation controls to the widget
-            from qtpy.QtWidgets import QSlider, QHBoxLayout, QPushButton
-            nav_layout = QHBoxLayout()
-            nav_layout.addWidget(QLabel("Frame:"))
+            self.viewer.reset_view()
+            self.video_layer.refresh()
             
-            # Create slider
+            # Simple navigation: slider + play button
+            nav_layout = QVBoxLayout()
+            
+            # Frame slider - compact and easy to use
+            slider_row = QHBoxLayout()
+            slider_row.addWidget(QLabel("Frame:"))
             self.frame_slider = QSlider()
-            self.frame_slider.setOrientation(0)  # Horizontal slider
+            self.frame_slider.setOrientation(Qt.Horizontal)  # Horizontal
             self.frame_slider.setMinimum(0)
             self.frame_slider.setMaximum(max(0, num_frames - 1))
             self.frame_slider.setValue(0)
             self.frame_slider.setEnabled(True)
-            # Use sliderReleased for less frequent updates, or valueChanged for real-time
-            self.frame_slider.sliderMoved.connect(self.on_slider_change)
+            self.frame_slider.setMaximumHeight(20)  # Compact height for easier dragging
+            self.frame_slider.setMinimumHeight(20)
+            self.frame_slider.setToolTip(f"Drag to navigate frames (0-{num_frames-1}). Use arrow keys when focused.")
             self.frame_slider.valueChanged.connect(self.on_slider_change)
-            nav_layout.addWidget(self.frame_slider)
+            # Enable keyboard focus for arrow keys
+            self.frame_slider.setFocusPolicy(Qt.StrongFocus)
+            slider_row.addWidget(self.frame_slider, stretch=1)  # Make slider expandable
+            self.frame_label = QLabel("0")
+            self.frame_label.setMinimumWidth(60)  # Fixed width for frame number
+            slider_row.addWidget(self.frame_label)
+            nav_layout.addLayout(slider_row)
             
-            self.frame_label = QLabel(f"0 / {num_frames - 1}")
-            nav_layout.addWidget(self.frame_label)
-            
-            # Add play/pause buttons
+            # Play button
             self.play_button = QPushButton("Play")
             self.play_button.clicked.connect(self.toggle_play)
             nav_layout.addWidget(self.play_button)
             
             self.layout().addLayout(nav_layout)
+            
+            # Install event filter for keyboard navigation on the viewer
+            self._setup_keyboard_navigation()
             
             # Store state
             self.num_frames = num_frames
@@ -279,8 +303,6 @@ class VideoLoaderWidget(QWidget):
             del first_frame
             
             self.info_label.setText(f"Loaded: {Path(path_str).name} ({num_frames} frames)")
-            print(f"SUCCESS: Video opened. Only current frame in memory.")
-            print(f"Frame slider range: 0 to {num_frames - 1}")
             
         except Exception as e:
             error_msg = f"Error: {type(e).__name__}: {str(e)}"
@@ -293,76 +315,46 @@ class VideoLoaderWidget(QWidget):
                 self.video_loader = None
     
     def on_slider_change(self, value):
-        """Load frame when slider changes - TRUE LAZY LOADING."""
-        if self.video_loader is None:
+        """Load frame when slider changes."""
+        if self.video_loader is None or "video" not in self.viewer.layers:
             return
         
-        # Always get the layer from viewer's layers collection (most reliable)
-        if "video" not in self.viewer.layers:
-            print("Warning: Video layer not found in viewer")
-            return
+        requested_frame = int(value)
         
-        # Get the layer directly from viewer (this ensures we have the correct reference)
-        video_layer = self.viewer.layers["video"]
+        # Always update label even if frame is the same
+        if self.frame_label:
+            self.frame_label.setText(str(requested_frame))
         
-        # Safety check
-        if not hasattr(video_layer, 'data'):
-            print(f"Warning: Video layer has no data attribute: {type(video_layer)}")
+        # Skip frame loading if it's the same frame (optimization)
+        if requested_frame == self.current_frame_idx:
+            # Still notify callback in case plot needs to update
+            if self.frame_changed_callback:
+                self.frame_changed_callback()
             return
         
         try:
-            requested_frame = int(value)
-            
-            # Skip if already showing this frame (avoid redundant loads)
-            if requested_frame == self.current_frame_idx:
-                return
-            
-            # Load ONLY this frame from disk
+            # Load frame from disk
             frame = self.video_loader.get_frame(requested_frame)
+            if len(frame.shape) == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # Update the SINGLE frame in our array (replacing the old one)
-            # This is the key - we only have ONE frame in memory at a time
-            # The data array has shape (1, H, W) or (1, H, W, C)
-            
-            # Prepare frame with time dimension: (1, H, W) or (1, H, W, C)
-            if len(frame.shape) == 2:
-                # Grayscale: add time dimension
-                frame_with_time = frame[np.newaxis, ...]
-            elif len(frame.shape) == 3:
-                # Color: add time dimension
-                frame_with_time = frame[np.newaxis, ...]
+            # Update layer
+            video_layer = self.viewer.layers["video"]
+            if video_layer.data.shape == frame.shape:
+                np.copyto(video_layer.data, frame)
             else:
-                print(f"Warning: Unexpected frame shape: {frame.shape}")
-                return
+                video_layer.data = frame
+            video_layer.refresh()
             
-            # Update the layer data directly
-            # Napari will automatically refresh when we assign to .data
-            video_layer.data = frame_with_time
-            
-            # Also update our stored reference
-            self.video_layer = video_layer
-            
-            # Update label
-            if self.frame_label:
-                self.frame_label.setText(f"{requested_frame} / {self.num_frames - 1}")
-            
-            # Store current frame
+            # Update UI
             self.current_frame_idx = requested_frame
             
-            # Free the frame (it's copied into video_layer.data)
-            del frame
-            
-            # Notify other widgets (e.g., Excel plot) of frame change
+            # Notify plot widget - always call this to ensure plot updates
             if self.frame_changed_callback:
-                try:
-                    self.frame_changed_callback()
-                except Exception as e:
-                    print(f"Error in frame change callback: {e}")
-            
+                self.frame_changed_callback()
+                
         except Exception as e:
             print(f"Error loading frame {value}: {e}")
-            import traceback
-            traceback.print_exc()
     
     def toggle_play(self):
         """Toggle video playback."""
@@ -370,32 +362,76 @@ class VideoLoaderWidget(QWidget):
             return
         
         if self.is_playing:
-            # Stop playback
             self.is_playing = False
             self.play_button.setText("Play")
             if self.play_timer:
                 self.play_timer.stop()
-                self.play_timer = None
         else:
-            # Start playback
             self.is_playing = True
             self.play_button.setText("Pause")
             from qtpy.QtCore import QTimer
-            self.play_timer = QTimer()
-            self.play_timer.timeout.connect(self.advance_frame)
+            if self.play_timer is None:
+                self.play_timer = QTimer()
+                self.play_timer.timeout.connect(self.advance_frame)
             self.play_timer.start(33)  # ~30 fps
     
     def advance_frame(self):
         """Advance to next frame during playback."""
-        if not self.is_playing or self.video_loader is None:
+        if not self.is_playing or self.video_loader is None or not self.frame_slider:
             return
         
         current = self.frame_slider.value()
         if current < self.num_frames - 1:
             self.frame_slider.setValue(current + 1)
         else:
-            # Reached end, stop playback
             self.toggle_play()
+    
+    def _setup_keyboard_navigation(self):
+        """Setup keyboard navigation for arrow keys."""
+        from qtpy.QtCore import QObject
+        
+        class KeyboardFilter(QObject):
+            """Event filter for keyboard navigation."""
+            def __init__(self, video_widget):
+                super().__init__()
+                self.video_widget = video_widget
+            
+            def eventFilter(self, obj, event):
+                """Filter key press events."""
+                from qtpy.QtGui import QKeyEvent
+                if isinstance(event, QKeyEvent) and event.type() == QKeyEvent.KeyPress:
+                    if self.video_widget.frame_slider is None or self.video_widget.video_loader is None:
+                        return False
+                    
+                    key = event.key()
+                    current = self.video_widget.frame_slider.value()
+                    
+                    if key == Qt.Key_Left:
+                        # Move backward one frame
+                        new_frame = max(0, current - 1)
+                        self.video_widget.frame_slider.setValue(new_frame)
+                        return True
+                    elif key == Qt.Key_Right:
+                        # Move forward one frame
+                        new_frame = min(self.video_widget.num_frames - 1, current + 1)
+                        self.video_widget.frame_slider.setValue(new_frame)
+                        return True
+                    elif key == Qt.Key_Space:
+                        # Toggle play/pause
+                        self.video_widget.toggle_play()
+                        return True
+                
+                return False
+        
+        # Install event filter on the viewer's canvas
+        try:
+            qt_viewer = self.viewer.window.qt_viewer
+            self.keyboard_filter = KeyboardFilter(self)
+            qt_viewer.canvas.installEventFilter(self.keyboard_filter)
+            # Also make canvas focusable
+            qt_viewer.canvas.setFocusPolicy(Qt.StrongFocus)
+        except Exception as e:
+            print(f"Could not setup keyboard navigation: {e}")
 
 
 class ExcelPlotWidget(QWidget):
@@ -405,6 +441,9 @@ class ExcelPlotWidget(QWidget):
         self.video_widget = video_widget  # Reference to video widget
         self.df = None
         self.frame_vline = None
+        self.current_plot_range = None  # Store (x_min, x_max) of current plot
+        self.current_feature = None  # Store current feature name
+        self.plot_slider = None  # Slider for plot navigation
 
         # --- Layout ---
         layout = QVBoxLayout()
@@ -427,10 +466,31 @@ class ExcelPlotWidget(QWidget):
         layout.addWidget(self.feature_combo)
 
         # Matplotlib figure
-        self.fig = Figure(figsize=(4, 3))
+        self.fig = Figure(figsize=(5, 4))
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
+        self.canvas.mpl_connect('button_press_event', self.on_plot_click)
         layout.addWidget(self.canvas)
+        
+        # Frame slider for plot navigation
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel("Frame:"))
+        self.plot_slider = QSlider()
+        self.plot_slider.setOrientation(Qt.Horizontal)
+        self.plot_slider.setMinimum(0)
+        self.plot_slider.setMaximum(0)  # Will be updated when data is loaded
+        self.plot_slider.setValue(0)
+        self.plot_slider.setEnabled(False)
+        self.plot_slider.setMaximumHeight(20)
+        self.plot_slider.setMinimumHeight(20)
+        self.plot_slider.setToolTip("Drag to navigate frames. Synced with video.")
+        self.plot_slider.valueChanged.connect(self.on_plot_slider_change)
+        self.plot_slider.setFocusPolicy(Qt.StrongFocus)
+        slider_row.addWidget(self.plot_slider, stretch=1)
+        self.plot_frame_label = QLabel("0")
+        self.plot_frame_label.setMinimumWidth(60)
+        slider_row.addWidget(self.plot_frame_label)
+        layout.addLayout(slider_row)
 
     def load_excel(self):
         """Open a dialog, load Excel into a DataFrame, populate feature combo."""
@@ -464,6 +524,17 @@ class ExcelPlotWidget(QWidget):
         self.feature_combo.clear()
         self.feature_combo.addItems(numeric_cols)
         self.feature_combo.setEnabled(True)
+        
+        # Update plot slider range
+        if self.plot_slider:
+            max_frame = len(self.df) - 1
+            self.plot_slider.setMaximum(max(0, max_frame))
+            self.plot_slider.setEnabled(True)
+            # Sync with video slider if available
+            if self.video_widget and self.video_widget.frame_slider:
+                current_video_frame = self.video_widget.frame_slider.value()
+                current_video_frame = max(0, min(current_video_frame, max_frame))
+                self.plot_slider.setValue(current_video_frame)
 
         # Plot first feature by default
         self.update_plot(self.feature_combo.currentText())
@@ -471,48 +542,129 @@ class ExcelPlotWidget(QWidget):
     def get_current_frame(self):
         """Get current frame index from video widget if available."""
         # Get frame from video widget's slider
-        if self.video_widget and hasattr(self.video_widget, 'frame_slider'):
+        if (self.video_widget and 
+            hasattr(self.video_widget, 'frame_slider') and 
+            self.video_widget.frame_slider is not None):
             return self.video_widget.frame_slider.value()
         return 0
 
     def update_plot(self, feature_name: str):
-        """Plot the selected feature vs row index, add/update vertical frame line."""
+        """Plot feature with ±100 frame zoom around current frame."""
         if self.df is None or not feature_name:
             return
 
         self.ax.clear()
-
-        x = self.df.index.to_numpy()  # treat row index as "frame"
-        y = self.df[feature_name].to_numpy()
-
+        frame = self.get_current_frame()
+        frame = max(0, min(frame, len(self.df) - 1))
+        
+        # Get ±100 frame range
+        x_min = max(0, frame - 100)
+        x_max = min(len(self.df) - 1, frame + 100)
+        
+        # Plot visible range
+        x = self.df.index[x_min:x_max+1].to_numpy()
+        y = self.df[feature_name].iloc[x_min:x_max+1].to_numpy()
+        
         self.ax.plot(x, y, 'b-', linewidth=1.5)
+        self.frame_vline = self.ax.axvline(frame, color='r', linestyle="--", linewidth=2)
         self.ax.set_title(feature_name)
         self.ax.set_xlabel("Frame")
         self.ax.set_ylabel(feature_name)
         self.ax.grid(True, alpha=0.3)
-
-        # Add a vertical line at current frame
-        frame = self.get_current_frame()
-        # Clamp frame to valid range
-        frame = max(0, min(frame, len(self.df) - 1))
-        self.frame_vline = self.ax.axvline(frame, color='r', linestyle="--", linewidth=2, label='Current frame')
         
-        # Set x-axis limits to show full data range
-        self.ax.set_xlim(-0.5, len(self.df) - 0.5)
-
+        # Set x-axis to ±100 range
+        padding = (x_max - x_min) * 0.05
+        self.ax.set_xlim(x_min - padding, x_max + padding)
+        
+        # Auto-scale y-axis
+        valid_y = y[np.isfinite(y)]
+        if len(valid_y) > 0:
+            y_min = valid_y.min()
+            y_max = valid_y.max()
+            if np.isfinite(y_min) and np.isfinite(y_max):
+                y_padding = (y_max - y_min) * 0.1 if y_max != y_min else abs(y_max) * 0.1 if y_max != 0 else 1
+                self.ax.set_ylim(y_min - y_padding, y_max + y_padding)
+        
+        # Store current plot state for optimization
+        self.current_plot_range = (x_min, x_max)
+        self.current_feature = feature_name
         self.fig.tight_layout()
         self.canvas.draw_idle()
+    
+    def on_plot_click(self, event):
+        """Click plot to navigate video."""
+        if event.inaxes != self.ax or self.df is None:
+            return
+        if event.xdata is None:
+            return
+        clicked_frame = max(0, min(int(round(event.xdata)), len(self.df) - 1))
+        # Update both sliders
+        if self.plot_slider:
+            self.plot_slider.setValue(clicked_frame)
+        if self.video_widget and self.video_widget.frame_slider:
+            # Set slider value - this will trigger on_slider_change which updates video and plot
+            # No need to block signals since on_frame_change checks if replot is needed
+            self.video_widget.frame_slider.setValue(clicked_frame)
+    
+    def on_plot_slider_change(self, value):
+        """Handle plot slider changes - sync with video slider."""
+        if self.df is None:
+            return
+        
+        frame = int(value)
+        frame = max(0, min(frame, len(self.df) - 1))
+        
+        # Update label
+        if self.plot_frame_label:
+            self.plot_frame_label.setText(str(frame))
+        
+        # Sync with video slider
+        if self.video_widget and self.video_widget.frame_slider:
+            # Block signals to avoid recursive updates
+            self.video_widget.frame_slider.blockSignals(True)
+            self.video_widget.frame_slider.setValue(frame)
+            self.video_widget.frame_slider.blockSignals(False)
+            # Manually trigger update
+            self.video_widget.on_slider_change(frame)
+        
+        # Update plot
+        self.on_frame_change()
 
     def on_frame_change(self, event=None):
-        """Move vertical line when the viewer's current frame changes."""
-        if self.df is None or self.frame_vline is None:
+        """Update plot when video frame changes."""
+        if self.df is None:
             return
-
         frame = self.get_current_frame()
-        # Clamp frame to valid range
         frame = max(0, min(frame, len(self.df) - 1))
-        self.frame_vline.set_xdata([frame, frame])
-        self.canvas.draw_idle()
+        
+        # Sync plot slider with current frame
+        if self.plot_slider and self.plot_slider.value() != frame:
+            self.plot_slider.blockSignals(True)
+            self.plot_slider.setValue(frame)
+            self.plot_slider.blockSignals(False)
+            if self.plot_frame_label:
+                self.plot_frame_label.setText(str(frame))
+        
+        current_feature = self.feature_combo.currentText()
+        if not current_feature:
+            return
+        
+        # Check if we need to replot (frame outside current range or feature changed)
+        need_replot = False
+        if (self.current_plot_range is None or 
+            self.current_feature != current_feature or
+            frame < self.current_plot_range[0] or 
+            frame > self.current_plot_range[1]):
+            need_replot = True
+        
+        if need_replot:
+            # Full replot with new frame center
+            self.update_plot(current_feature)
+        else:
+            # Just update the vertical line position (much faster)
+            if self.frame_vline is not None:
+                self.frame_vline.set_xdata([frame, frame])
+                self.canvas.draw_idle()
 
 
 def setup_drag_drop(viewer, video_widget):
@@ -590,7 +742,7 @@ def main():
     # Connect video widget frame changes to Excel plot updates
     # When video frame changes, update the plot's frame indicator
     def update_plot_on_frame_change():
-        if excel_widget.df is not None and excel_widget.frame_vline is not None:
+        if excel_widget.df is not None:
             excel_widget.on_frame_change()
     
     # Store callback in video widget
