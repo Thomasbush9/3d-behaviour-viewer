@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.13.6"
+__generated_with = "0.17.7"
 app = marimo.App()
 
 
@@ -13,7 +13,7 @@ def _():
     from tqdm import tqdm
     import pandas as pd
     import openpyxl
-    return Path, pd, xr
+    return Path, pd, tqdm
 
 
 @app.cell
@@ -24,12 +24,46 @@ def _(Path):
 
 
 @app.cell
-def _(features_paths, pd, xr):
-    df_feature_1 = pd.read_excel(features_paths[0])
-    df = df_feature_1.copy()
-    df.index.name = "frame"   # important for xarray dims naming
+def _():
+    # video path frames:
+    import cv2
 
-    ds = xr.Dataset.from_dataframe(df)
+
+    # Custom function that returns total number of frames
+    def count_frames_opencv(video_path):
+        # Capturing the input video
+        video = cv2.VideoCapture(video_path)
+
+        # Accessing the CAP_PROP_FRAME_COUNT property
+        # To get the total frames
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        video.release()
+        return total_frames
+
+    # Example usage
+
+
+    # Input video
+    video_path = "/Users/thomasbush/Downloads/multicam_video_2025-05-07T12_16_20_cropped-v2_20250701121021/multicam_video_2025-05-07T12_16_20_central.mp4"
+
+    # Calling the custom function
+    frame_count = count_frames_opencv(video_path)
+    print(f"Total frames: {frame_count}")
+    return (frame_count,)
+
+
+@app.cell
+def _(features_paths, frame_count, pd, tqdm):
+    # find the correct data:
+    for pathname in tqdm(features_paths):
+        #laod the pd
+        df = pd.read_excel(pathname)
+        #get length
+        l = len(df)
+        if l == frame_count:
+            print("Correct feature path")
+            print(pathname.name)
+        
     return
 
 
