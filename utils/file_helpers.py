@@ -647,6 +647,7 @@ class ExcelPlotWidget(QWidget):
         self.selected_features = []  # List of selected feature names
         self.plot_axes = {}  # Dict: feature_name -> (ax, frame_vline, plot_range)
         self.plot_slider = None  # Slider for plot navigation
+        self.feature_y_limits = {}  # Store fixed y-axis limits for each feature
 
         # --- Layout ---
         main_layout = QVBoxLayout()
@@ -839,6 +840,7 @@ class ExcelPlotWidget(QWidget):
         self.plot_axes = {}
         self.fig = None
         self.canvas = None
+        self.feature_y_limits = {}  # Reset y-axis limits when clearing
     
     def on_feature_selection_changed(self):
         """Handle feature selection changes."""
@@ -872,8 +874,25 @@ class ExcelPlotWidget(QWidget):
             self.range_spinbox.setEnabled(True)
         self.update_all_plots()
     
-    def update_all_plots(self):
-        """Update all selected feature plots."""
+    def _calculate_fixed_y_limits(self, feature_name):
+        """Calculate fixed y-axis limits for a feature based on entire dataset."""
+        if feature_name not in self.feature_y_limits:
+            y_all = self.df[feature_name].to_numpy()
+            valid_y = y_all[np.isfinite(y_all)]
+            if len(valid_y) > 0:
+                y_min = valid_y.min()
+                y_max = valid_y.max()
+                if np.isfinite(y_min) and np.isfinite(y_max):
+                    y_padding = (y_max - y_min) * 0.1 if y_max != y_min else abs(y_max) * 0.1 if y_max != 0 else 1
+                    self.feature_y_limits[feature_name] = (y_min - y_padding, y_max + y_padding)
+                else:
+                    self.feature_y_limits[feature_name] = (0, 1)
+            else:
+                self.feature_y_limits[feature_name] = (0, 1)
+        return self.feature_y_limits[feature_name]
+    
+    def update_all_plots(self, force_replot=False):
+        """Update all selected feature plots with smooth scrolling."""
         if self.df is None or not self.selected_features:
             self._clear_plots()
             return
@@ -881,7 +900,7 @@ class ExcelPlotWidget(QWidget):
         frame = self.get_current_frame()
         frame = max(0, min(frame, len(self.df) - 1))
         
-        # Determine x-axis range
+        # Determine visible x-axis range
         if self.show_all:
             x_min = 0
             x_max = len(self.df) - 1
@@ -891,97 +910,116 @@ class ExcelPlotWidget(QWidget):
         
         # Create figure if needed or if number of features changed
         num_features = len(self.selected_features)
-        if self.fig is None or len(self.plot_axes) != num_features:
-            self._clear_plots()
-            self.fig = Figure(figsize=(8, 3 * num_features))
-            self.canvas = FigureCanvas(self.fig)
-            self.canvas.mpl_connect('button_press_event', self.on_plot_click)
-            
-            # Create subplots for each feature
-            for i, feature_name in enumerate(self.selected_features):
-                ax = self.fig.add_subplot(num_features, 1, i + 1)
-                self.plot_axes[feature_name] = {
-                    'ax': ax,
-                    'vline': None,
-                    'plot_range': None,
-                    'index': i
-                }
-            
-            self.plots_layout.addWidget(self.canvas)
+        needs_initial_plot = (self.fig is None or len(self.plot_axes) != num_features or force_replot)
         
-        # Update each plot
+        if needs_initial_plot:
+            if self.fig is None or len(self.plot_axes) != num_features:
+                self._clear_plots()
+                self.fig = Figure(figsize=(8, 3 * num_features))
+                self.canvas = FigureCanvas(self.fig)
+                self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+                
+                # Create subplots for each feature
+                for i, feature_name in enumerate(self.selected_features):
+                    ax = self.fig.add_subplot(num_features, 1, i + 1)
+                    self.plot_axes[feature_name] = {
+                        'ax': ax,
+                        'vline': None,
+                        'plot_range': None,
+                        'index': i,
+                        'line': None  # Store line object for smooth updates
+                    }
+                
+                self.plots_layout.addWidget(self.canvas)
+            
+            # Plot entire dataset for smooth scrolling (or large buffer)
+            # For performance, we'll plot the full dataset but it's already in memory
+            for feature_name in self.selected_features:
+                if feature_name not in self.plot_axes:
+                    continue
+                
+                ax = self.plot_axes[feature_name]['ax']
+                ax.clear()
+                plot_idx = self.plot_axes[feature_name]['index']
+                
+                # Plot entire dataset
+                x_indices_all = self.df.index.to_numpy()
+                if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                    if hasattr(self.video_widget, 'frame_to_time'):
+                        x_all = np.array([self.video_widget.frame_to_time(idx) for idx in x_indices_all])
+                    else:
+                        x_all = x_indices_all
+                else:
+                    x_all = x_indices_all
+                
+                y_all = self.df[feature_name].to_numpy()
+                
+                # Plot the line (store reference for smooth updates)
+                line, = ax.plot(x_all, y_all, 'b-', linewidth=1.5)
+                self.plot_axes[feature_name]['line'] = line
+                
+                # Add vertical line
+                if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                    if hasattr(self.video_widget, 'frame_to_time'):
+                        vline_x = self.video_widget.frame_to_time(frame)
+                    else:
+                        vline_x = frame
+                else:
+                    vline_x = frame
+                
+                vline = ax.axvline(vline_x, color='r', linestyle="--", linewidth=2)
+                self.plot_axes[feature_name]['vline'] = vline
+                
+                ax.set_title(feature_name)
+                # Update x-axis label based on unit
+                if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                    xlabel = "Time (s)" if plot_idx == num_features - 1 else ""
+                else:
+                    xlabel = "Frame" if plot_idx == num_features - 1 else ""
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(feature_name)
+                ax.grid(True, alpha=0.3)
+                
+                # Set fixed y-axis limits based on entire dataset
+                y_min_fixed, y_max_fixed = self._calculate_fixed_y_limits(feature_name)
+                ax.set_ylim(y_min_fixed, y_max_fixed)
+        
+        # Update visible x-axis range and vertical line (smooth scrolling)
         for feature_name in self.selected_features:
             if feature_name not in self.plot_axes:
                 continue
             
             ax = self.plot_axes[feature_name]['ax']
-            ax.clear()
-            plot_idx = self.plot_axes[feature_name]['index']
             
-            # Get data range
-            if self.show_all:
-                plot_x_min = x_min
-                plot_x_max = x_max
-            else:
-                plot_x_min = x_min
-                plot_x_max = x_max
-            
-            # Plot data - convert x-axis to time if needed
-            x_indices = self.df.index[plot_x_min:plot_x_max+1].to_numpy()
+            # Update vertical line position
             if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
-                # Convert frame indices to time
                 if hasattr(self.video_widget, 'frame_to_time'):
-                    x = np.array([self.video_widget.frame_to_time(idx) for idx in x_indices])
                     vline_x = self.video_widget.frame_to_time(frame)
                 else:
-                    x = x_indices
                     vline_x = frame
             else:
-                x = x_indices
                 vline_x = frame
             
-            y = self.df[feature_name].iloc[plot_x_min:plot_x_max+1].to_numpy()
+            if self.plot_axes[feature_name]['vline'] is not None:
+                self.plot_axes[feature_name]['vline'].set_xdata([vline_x, vline_x])
             
-            ax.plot(x, y, 'b-', linewidth=1.5)
-            vline = ax.axvline(vline_x, color='r', linestyle="--", linewidth=2)
-            
-            ax.set_title(feature_name)
-            # Update x-axis label based on unit
-            if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
-                xlabel = "Time (s)" if plot_idx == num_features - 1 else ""
-            else:
-                xlabel = "Frame" if plot_idx == num_features - 1 else ""
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(feature_name)
-            ax.grid(True, alpha=0.3)
-            
-            # Set x-axis limits - convert to time if needed
+            # Update x-axis limits (smooth scrolling - no replot needed)
             if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
                 if hasattr(self.video_widget, 'frame_to_time'):
-                    x_min_display = self.video_widget.frame_to_time(plot_x_min)
-                    x_max_display = self.video_widget.frame_to_time(plot_x_max)
+                    x_min_display = self.video_widget.frame_to_time(x_min)
+                    x_max_display = self.video_widget.frame_to_time(x_max)
                 else:
-                    x_min_display = plot_x_min
-                    x_max_display = plot_x_max
+                    x_min_display = x_min
+                    x_max_display = x_max
             else:
-                x_min_display = plot_x_min
-                x_max_display = plot_x_max
+                x_min_display = x_min
+                x_max_display = x_max
             
             padding = (x_max_display - x_min_display) * 0.05 if x_max_display > x_min_display else 1
             ax.set_xlim(x_min_display - padding, x_max_display + padding)
             
-            # Auto-scale y-axis
-            valid_y = y[np.isfinite(y)]
-            if len(valid_y) > 0:
-                y_min = valid_y.min()
-                y_max = valid_y.max()
-                if np.isfinite(y_min) and np.isfinite(y_max):
-                    y_padding = (y_max - y_min) * 0.1 if y_max != y_min else abs(y_max) * 0.1 if y_max != 0 else 1
-                    ax.set_ylim(y_min - y_padding, y_max + y_padding)
-            
-            # Store references
-            self.plot_axes[feature_name]['vline'] = vline
-            self.plot_axes[feature_name]['plot_range'] = (plot_x_min, plot_x_max)
+            # Store current visible range
+            self.plot_axes[feature_name]['plot_range'] = (x_min, x_max)
         
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -1058,49 +1096,19 @@ class ExcelPlotWidget(QWidget):
         unit_changed = (stored_show_time is not None and stored_show_time != current_show_time)
         self._last_show_time = current_show_time
         
-        # Check if we need to replot (frame outside current range, show_all mode, or unit changed)
+        # Check if we need to replot (unit changed)
         need_replot = False
         if unit_changed:
             # Unit changed - must replot to update x-axis values
             need_replot = True
-        elif self.show_all:
-            # In show_all mode, just update vertical lines
-            need_replot = False
-        else:
-            # Check if frame is outside any plot's range
-            for feature_name in self.selected_features:
-                if feature_name not in self.plot_axes:
-                    need_replot = True
-                    break
-                plot_range = self.plot_axes[feature_name]['plot_range']
-                if plot_range is None:
-                    need_replot = True
-                    break
-                if frame < plot_range[0] or frame > plot_range[1]:
-                    need_replot = True
-                    break
         
         if need_replot:
             # Full replot with new frame center
-            self.update_all_plots()
+            self.update_all_plots(force_replot=True)
         else:
-            # Just update the vertical line positions (much faster)
-            if self.canvas and self.fig:
-                # Convert frame to display unit if needed
-                if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
-                    if hasattr(self.video_widget, 'frame_to_time'):
-                        vline_x = self.video_widget.frame_to_time(frame)
-                    else:
-                        vline_x = frame
-                else:
-                    vline_x = frame
-                
-                for feature_name in self.selected_features:
-                    if feature_name in self.plot_axes:
-                        vline = self.plot_axes[feature_name]['vline']
-                        if vline is not None:
-                            vline.set_xdata([vline_x, vline_x])
-                self.canvas.draw_idle()
+            # Smooth scrolling - just update xlim and vertical line (no replot needed)
+            # The entire dataset is already plotted, we just change the visible window
+            self.update_all_plots(force_replot=False)
 
 
 def setup_drag_drop(viewer, video_widget):
