@@ -112,6 +112,10 @@ class VideoLoaderWidget(QWidget):
         self.frame_changed_callback = None
         self.current_frame_idx = -1
         self.num_frames = 0
+        self.fps = 60.0  # Default FPS, can be changed
+        self.show_time = False  # False = frames, True = seconds
+        self.playback_speed = 1.0  # Playback speed multiplier
+        self.step_size = 1  # Step size in frames or seconds
         
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -122,6 +126,16 @@ class VideoLoaderWidget(QWidget):
         
         self.info_label = QLabel("Drag & drop video file or click button to load")
         layout.addWidget(self.info_label)
+        
+        # Time unit toggle
+        unit_layout = QHBoxLayout()
+        unit_layout.addWidget(QLabel("Display unit:"))
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(["Frames", "Seconds"])
+        self.unit_combo.currentTextChanged.connect(self.on_unit_changed)
+        self.unit_combo.setEnabled(False)
+        unit_layout.addWidget(self.unit_combo)
+        layout.addLayout(unit_layout)
         
         # Enable keyboard focus for arrow key navigation
         self.setFocusPolicy(Qt.StrongFocus)
@@ -266,12 +280,28 @@ class VideoLoaderWidget(QWidget):
             self.viewer.reset_view()
             self.video_layer.refresh()
             
-            # Simple navigation: slider + play button
+            # Navigation controls
             nav_layout = QVBoxLayout()
             
-            # Frame slider - compact and easy to use
+            # Go to timestamp input
+            goto_layout = QHBoxLayout()
+            goto_layout.addWidget(QLabel("Go to:"))
+            self.goto_input = QSpinBox()
+            self.goto_input.setMinimum(0)
+            self.goto_input.setMaximum(max(0, num_frames - 1))
+            self.goto_input.setValue(0)
+            self.goto_input.setEnabled(True)
+            self.goto_input.valueChanged.connect(self.on_goto_changed)
+            goto_layout.addWidget(self.goto_input)
+            self.goto_label = QLabel("frame" if not self.show_time else "sec")
+            goto_layout.addWidget(self.goto_label)
+            goto_layout.addStretch()
+            nav_layout.addLayout(goto_layout)
+            
+            # Frame/time slider - compact and easy to use
             slider_row = QHBoxLayout()
-            slider_row.addWidget(QLabel("Frame:"))
+            self.slider_label = QLabel("Frame:" if not self.show_time else "Time:")
+            slider_row.addWidget(self.slider_label)
             self.frame_slider = QSlider()
             self.frame_slider.setOrientation(Qt.Horizontal)  # Horizontal
             self.frame_slider.setMinimum(0)
@@ -280,22 +310,67 @@ class VideoLoaderWidget(QWidget):
             self.frame_slider.setEnabled(True)
             self.frame_slider.setMaximumHeight(20)  # Compact height for easier dragging
             self.frame_slider.setMinimumHeight(20)
-            self.frame_slider.setToolTip(f"Drag to navigate frames (0-{num_frames-1}). Use arrow keys when focused.")
+            self._update_slider_tooltip()
             self.frame_slider.valueChanged.connect(self.on_slider_change)
             # Enable keyboard focus for arrow keys
             self.frame_slider.setFocusPolicy(Qt.StrongFocus)
             slider_row.addWidget(self.frame_slider, stretch=1)  # Make slider expandable
             self.frame_label = QLabel("0")
-            self.frame_label.setMinimumWidth(60)  # Fixed width for frame number
+            self.frame_label.setMinimumWidth(80)  # Wider for time display
             slider_row.addWidget(self.frame_label)
             nav_layout.addLayout(slider_row)
             
-            # Play button
+            # Playback controls
+            playback_layout = QHBoxLayout()
             self.play_button = QPushButton("Play")
             self.play_button.clicked.connect(self.toggle_play)
-            nav_layout.addWidget(self.play_button)
+            playback_layout.addWidget(self.play_button)
+            
+            # Step backward
+            self.step_back_button = QPushButton("◄◄")
+            self.step_back_button.setToolTip("Step backward")
+            self.step_back_button.clicked.connect(lambda: self.step_frame(-1))
+            playback_layout.addWidget(self.step_back_button)
+            
+            # Step forward
+            self.step_forward_button = QPushButton("►►")
+            self.step_forward_button.setToolTip("Step forward")
+            self.step_forward_button.clicked.connect(lambda: self.step_frame(1))
+            playback_layout.addWidget(self.step_forward_button)
+            
+            playback_layout.addStretch()
+            nav_layout.addLayout(playback_layout)
+            
+            # Playback speed control
+            speed_layout = QHBoxLayout()
+            speed_layout.addWidget(QLabel("Speed:"))
+            self.speed_spinbox = QSpinBox()
+            self.speed_spinbox.setMinimum(1)
+            self.speed_spinbox.setMaximum(100)
+            self.speed_spinbox.setValue(100)
+            self.speed_spinbox.setSuffix("%")
+            self.speed_spinbox.setEnabled(True)
+            self.speed_spinbox.valueChanged.connect(self.on_speed_changed)
+            speed_layout.addWidget(self.speed_spinbox)
+            
+            # Step size control
+            speed_layout.addWidget(QLabel("Step:"))
+            self.step_spinbox = QSpinBox()
+            self.step_spinbox.setMinimum(1)
+            self.step_spinbox.setMaximum(1000)
+            self.step_spinbox.setValue(1)
+            self.step_spinbox.setEnabled(True)
+            self.step_spinbox.valueChanged.connect(self.on_step_size_changed)
+            speed_layout.addWidget(self.step_spinbox)
+            self.step_size_label = QLabel("frame" if not self.show_time else "sec")
+            speed_layout.addWidget(self.step_size_label)
+            speed_layout.addStretch()
+            nav_layout.addLayout(speed_layout)
             
             self.layout().addLayout(nav_layout)
+            
+            # Enable unit combo after video is loaded
+            self.unit_combo.setEnabled(True)
             
             # Install event filter for keyboard navigation on the viewer
             self._setup_keyboard_navigation()
@@ -319,6 +394,118 @@ class VideoLoaderWidget(QWidget):
                 self.video_loader.close()
                 self.video_loader = None
     
+    def frame_to_time(self, frame):
+        """Convert frame number to time in seconds."""
+        return frame / self.fps
+    
+    def time_to_frame(self, time):
+        """Convert time in seconds to frame number."""
+        return int(time * self.fps)
+    
+    def _update_display(self, frame):
+        """Update all display labels with current frame/time."""
+        if self.show_time:
+            time_val = self.frame_to_time(frame)
+            display_str = f"{time_val:.2f}s"
+            if self.frame_label:
+                self.frame_label.setText(display_str)
+        else:
+            if self.frame_label:
+                self.frame_label.setText(str(frame))
+    
+    def _update_slider_tooltip(self):
+        """Update slider tooltip based on current unit."""
+        if self.frame_slider:
+            if self.show_time:
+                max_time = self.frame_to_time(self.num_frames - 1)
+                self.frame_slider.setToolTip(f"Drag to navigate time (0-{max_time:.2f}s). Use arrow keys when focused.")
+            else:
+                self.frame_slider.setToolTip(f"Drag to navigate frames (0-{self.num_frames-1}). Use arrow keys when focused.")
+    
+    def on_unit_changed(self, unit_text):
+        """Handle unit change (Frames/Seconds)."""
+        self.show_time = (unit_text == "Seconds")
+        
+        # Update labels
+        if hasattr(self, 'slider_label'):
+            self.slider_label.setText("Time:" if self.show_time else "Frame:")
+        if hasattr(self, 'goto_label'):
+            self.goto_label.setText("sec" if self.show_time else "frame")
+        if hasattr(self, 'step_size_label'):
+            self.step_size_label.setText("sec" if self.show_time else "frame")
+        
+        # Update goto input max value
+        if hasattr(self, 'goto_input') and self.num_frames > 0:
+            if self.show_time:
+                max_time = int(self.frame_to_time(self.num_frames - 1))
+                self.goto_input.setMaximum(max_time)
+                self.goto_input.setValue(int(self.frame_to_time(self.current_frame_idx)))
+            else:
+                self.goto_input.setMaximum(self.num_frames - 1)
+                self.goto_input.setValue(self.current_frame_idx)
+        
+        # Update step size label and limits
+        if hasattr(self, 'step_spinbox'):
+            if self.show_time:
+                # Convert current step size from frames to seconds
+                self.step_size = max(1, int(self.frame_to_time(self.step_size)))
+                self.step_spinbox.setMaximum(int(self.frame_to_time(1000)))
+            else:
+                # Convert current step size from seconds to frames
+                self.step_size = max(1, self.time_to_frame(self.step_size))
+                self.step_spinbox.setMaximum(1000)
+            self.step_spinbox.setValue(self.step_size)
+        
+        # Update display
+        self._update_display(self.current_frame_idx)
+        self._update_slider_tooltip()
+        
+        # Notify plot widget of unit change - this will trigger a replot with new units
+        if self.frame_changed_callback:
+            self.frame_changed_callback()
+    
+    def on_goto_changed(self, value):
+        """Handle go to timestamp/frame input."""
+        if self.video_loader is None:
+            return
+        
+        if self.show_time:
+            target_frame = self.time_to_frame(value)
+        else:
+            target_frame = int(value)
+        
+        target_frame = max(0, min(target_frame, self.num_frames - 1))
+        self.frame_slider.setValue(target_frame)
+    
+    def on_speed_changed(self, value):
+        """Handle playback speed change."""
+        self.playback_speed = value / 100.0  # Convert percentage to multiplier
+        # Update timer if playing
+        if self.is_playing and self.play_timer:
+            interval = int(1000 / (self.fps * self.playback_speed))
+            self.play_timer.setInterval(interval)
+    
+    def on_step_size_changed(self, value):
+        """Handle step size change."""
+        self.step_size = value
+    
+    def step_frame(self, direction):
+        """Step forward or backward by step_size."""
+        if self.video_loader is None:
+            return
+        
+        current = self.current_frame_idx
+        if self.show_time:
+            # Step in seconds
+            step_frames = self.time_to_frame(self.step_size)
+        else:
+            # Step in frames
+            step_frames = self.step_size
+        
+        new_frame = current + (direction * step_frames)
+        new_frame = max(0, min(new_frame, self.num_frames - 1))
+        self.frame_slider.setValue(new_frame)
+    
     def on_slider_change(self, value):
         """Load frame when slider changes."""
         if self.video_loader is None or "video" not in self.viewer.layers:
@@ -326,9 +513,17 @@ class VideoLoaderWidget(QWidget):
         
         requested_frame = int(value)
         
-        # Always update label even if frame is the same
-        if self.frame_label:
-            self.frame_label.setText(str(requested_frame))
+        # Update display label
+        self._update_display(requested_frame)
+        
+        # Update goto input if it's not being changed by user
+        if hasattr(self, 'goto_input'):
+            self.goto_input.blockSignals(True)
+            if self.show_time:
+                self.goto_input.setValue(int(self.frame_to_time(requested_frame)))
+            else:
+                self.goto_input.setValue(requested_frame)
+            self.goto_input.blockSignals(False)
         
         # Skip frame loading if it's the same frame (optimization)
         if requested_frame == self.current_frame_idx:
@@ -378,7 +573,9 @@ class VideoLoaderWidget(QWidget):
             if self.play_timer is None:
                 self.play_timer = QTimer()
                 self.play_timer.timeout.connect(self.advance_frame)
-            self.play_timer.start(33)  # ~30 fps
+            # Calculate interval based on FPS and playback speed
+            interval = int(1000 / (self.fps * self.playback_speed))
+            self.play_timer.start(interval)
     
     def advance_frame(self):
         """Advance to next frame during playback."""
@@ -516,7 +713,8 @@ class ExcelPlotWidget(QWidget):
         
         # Frame slider for plot navigation
         slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel("Frame:"))
+        self.plot_slider_label = QLabel("Frame:")
+        slider_row.addWidget(self.plot_slider_label)
         self.plot_slider = QSlider()
         self.plot_slider.setOrientation(Qt.Horizontal)
         self.plot_slider.setMinimum(0)
@@ -530,7 +728,7 @@ class ExcelPlotWidget(QWidget):
         self.plot_slider.setFocusPolicy(Qt.StrongFocus)
         slider_row.addWidget(self.plot_slider, stretch=1)
         self.plot_frame_label = QLabel("0")
-        self.plot_frame_label.setMinimumWidth(60)
+        self.plot_frame_label.setMinimumWidth(80)
         slider_row.addWidget(self.plot_frame_label)
         main_layout.addLayout(slider_row)
 
@@ -601,6 +799,29 @@ class ExcelPlotWidget(QWidget):
             self.video_widget.frame_slider is not None):
             return self.video_widget.frame_slider.value()
         return 0
+    
+    def _update_plot_display(self, frame):
+        """Update plot display label based on video widget's unit setting."""
+        if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+            if hasattr(self.video_widget, 'frame_to_time'):
+                time_val = self.video_widget.frame_to_time(frame)
+                self.plot_frame_label.setText(f"{time_val:.2f}s")
+        else:
+            self.plot_frame_label.setText(str(frame))
+    
+    def _update_plot_labels(self):
+        """Update plot labels based on video widget's unit setting."""
+        if self.video_widget and hasattr(self.video_widget, 'show_time'):
+            show_time = self.video_widget.show_time
+            if hasattr(self, 'plot_slider_label'):
+                self.plot_slider_label.setText("Time:" if show_time else "Frame:")
+            # Update x-axis labels in plots
+            if self.fig and self.plot_axes:
+                for feature_name, plot_data in self.plot_axes.items():
+                    ax = plot_data['ax']
+                    ax.set_xlabel("Time (s)" if show_time else "Frame")
+                if self.canvas:
+                    self.canvas.draw_idle()
     
     def toggle_features_visibility(self):
         """Toggle visibility of the feature selection list."""
@@ -705,21 +926,49 @@ class ExcelPlotWidget(QWidget):
                 plot_x_min = x_min
                 plot_x_max = x_max
             
-            # Plot data
-            x = self.df.index[plot_x_min:plot_x_max+1].to_numpy()
+            # Plot data - convert x-axis to time if needed
+            x_indices = self.df.index[plot_x_min:plot_x_max+1].to_numpy()
+            if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                # Convert frame indices to time
+                if hasattr(self.video_widget, 'frame_to_time'):
+                    x = np.array([self.video_widget.frame_to_time(idx) for idx in x_indices])
+                    vline_x = self.video_widget.frame_to_time(frame)
+                else:
+                    x = x_indices
+                    vline_x = frame
+            else:
+                x = x_indices
+                vline_x = frame
+            
             y = self.df[feature_name].iloc[plot_x_min:plot_x_max+1].to_numpy()
             
             ax.plot(x, y, 'b-', linewidth=1.5)
-            vline = ax.axvline(frame, color='r', linestyle="--", linewidth=2)
+            vline = ax.axvline(vline_x, color='r', linestyle="--", linewidth=2)
             
             ax.set_title(feature_name)
-            ax.set_xlabel("Frame" if plot_idx == num_features - 1 else "")
+            # Update x-axis label based on unit
+            if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                xlabel = "Time (s)" if plot_idx == num_features - 1 else ""
+            else:
+                xlabel = "Frame" if plot_idx == num_features - 1 else ""
+            ax.set_xlabel(xlabel)
             ax.set_ylabel(feature_name)
             ax.grid(True, alpha=0.3)
             
-            # Set x-axis limits
-            padding = (plot_x_max - plot_x_min) * 0.05 if plot_x_max > plot_x_min else 1
-            ax.set_xlim(plot_x_min - padding, plot_x_max + padding)
+            # Set x-axis limits - convert to time if needed
+            if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                if hasattr(self.video_widget, 'frame_to_time'):
+                    x_min_display = self.video_widget.frame_to_time(plot_x_min)
+                    x_max_display = self.video_widget.frame_to_time(plot_x_max)
+                else:
+                    x_min_display = plot_x_min
+                    x_max_display = plot_x_max
+            else:
+                x_min_display = plot_x_min
+                x_max_display = plot_x_max
+            
+            padding = (x_max_display - x_min_display) * 0.05 if x_max_display > x_min_display else 1
+            ax.set_xlim(x_min_display - padding, x_max_display + padding)
             
             # Auto-scale y-axis
             valid_y = y[np.isfinite(y)]
@@ -767,9 +1016,8 @@ class ExcelPlotWidget(QWidget):
         frame = int(value)
         frame = max(0, min(frame, len(self.df) - 1))
         
-        # Update label
-        if self.plot_frame_label:
-            self.plot_frame_label.setText(str(frame))
+        # Update label with correct unit
+        self._update_plot_display(frame)
         
         # Sync with video slider
         if self.video_widget and self.video_widget.frame_slider:
@@ -795,15 +1043,27 @@ class ExcelPlotWidget(QWidget):
             self.plot_slider.blockSignals(True)
             self.plot_slider.setValue(frame)
             self.plot_slider.blockSignals(False)
-            if self.plot_frame_label:
-                self.plot_frame_label.setText(str(frame))
+            self._update_plot_display(frame)
+        
+        # Update plot labels if unit changed
+        self._update_plot_labels()
         
         if not self.selected_features:
             return
         
-        # Check if we need to replot (frame outside current range or show_all mode)
+        # Check if unit changed - if so, we need to replot to update x-axis values
+        current_show_time = (self.video_widget and hasattr(self.video_widget, 'show_time') and 
+                            self.video_widget.show_time) if self.video_widget else False
+        stored_show_time = getattr(self, '_last_show_time', None)
+        unit_changed = (stored_show_time is not None and stored_show_time != current_show_time)
+        self._last_show_time = current_show_time
+        
+        # Check if we need to replot (frame outside current range, show_all mode, or unit changed)
         need_replot = False
-        if self.show_all:
+        if unit_changed:
+            # Unit changed - must replot to update x-axis values
+            need_replot = True
+        elif self.show_all:
             # In show_all mode, just update vertical lines
             need_replot = False
         else:
@@ -826,11 +1086,20 @@ class ExcelPlotWidget(QWidget):
         else:
             # Just update the vertical line positions (much faster)
             if self.canvas and self.fig:
+                # Convert frame to display unit if needed
+                if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                    if hasattr(self.video_widget, 'frame_to_time'):
+                        vline_x = self.video_widget.frame_to_time(frame)
+                    else:
+                        vline_x = frame
+                else:
+                    vline_x = frame
+                
                 for feature_name in self.selected_features:
                     if feature_name in self.plot_axes:
                         vline = self.plot_axes[feature_name]['vline']
                         if vline is not None:
-                            vline.set_xdata([frame, frame])
+                            vline.set_xdata([vline_x, vline_x])
                 self.canvas.draw_idle()
 
 
