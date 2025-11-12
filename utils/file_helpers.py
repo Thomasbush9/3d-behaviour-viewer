@@ -14,6 +14,11 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
+    QCheckBox,
+    QSpinBox,
+    QScrollArea,
 )
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QKeyEvent
@@ -440,37 +445,74 @@ class ExcelPlotWidget(QWidget):
         self.viewer = viewer
         self.video_widget = video_widget  # Reference to video widget
         self.df = None
-        self.frame_vline = None
-        self.current_plot_range = None  # Store (x_min, x_max) of current plot
-        self.current_feature = None  # Store current feature name
+        self.frame_range = 100  # Default ±100 frames
+        self.show_all = False  # Whether to show entire dataset
+        self.selected_features = []  # List of selected feature names
+        self.plot_axes = {}  # Dict: feature_name -> (ax, frame_vline, plot_range)
         self.plot_slider = None  # Slider for plot navigation
 
         # --- Layout ---
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
 
         # Button: load Excel
         self.load_button = QPushButton("Load Excel file...")
         self.load_button.clicked.connect(self.load_excel)
-        layout.addWidget(self.load_button)
+        main_layout.addWidget(self.load_button)
 
         # Info label
         self.info_label = QLabel("No file loaded.")
-        layout.addWidget(self.info_label)
+        main_layout.addWidget(self.info_label)
 
-        # Combo: choose feature (column)
-        layout.addWidget(QLabel("Feature to plot:"))
-        self.feature_combo = QComboBox()
-        self.feature_combo.currentTextChanged.connect(self.update_plot)
-        self.feature_combo.setEnabled(False)
-        layout.addWidget(self.feature_combo)
+        # Feature selection: collapsible section
+        feature_header = QHBoxLayout()
+        feature_label = QLabel("Select features to plot:")
+        feature_header.addWidget(feature_label)
+        feature_header.addStretch()
+        self.toggle_features_button = QPushButton("Hide")
+        self.toggle_features_button.setMaximumWidth(60)
+        self.toggle_features_button.clicked.connect(self.toggle_features_visibility)
+        self.toggle_features_button.setEnabled(False)
+        feature_header.addWidget(self.toggle_features_button)
+        main_layout.addLayout(feature_header)
+        
+        self.feature_list = QListWidget()
+        self.feature_list.setEnabled(False)
+        self.feature_list.itemChanged.connect(self.on_feature_selection_changed)
+        self.feature_list.setVisible(True)  # Start visible
+        main_layout.addWidget(self.feature_list)
 
-        # Matplotlib figure
-        self.fig = Figure(figsize=(5, 4))
-        self.canvas = FigureCanvas(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas.mpl_connect('button_press_event', self.on_plot_click)
-        layout.addWidget(self.canvas)
+        # Range controls
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Frame range (±):"))
+        self.range_spinbox = QSpinBox()
+        self.range_spinbox.setMinimum(1)
+        self.range_spinbox.setMaximum(10000)
+        self.range_spinbox.setValue(100)
+        self.range_spinbox.setEnabled(False)
+        self.range_spinbox.valueChanged.connect(self.on_range_changed)
+        range_layout.addWidget(self.range_spinbox)
+        
+        self.show_all_button = QPushButton("Show All")
+        self.show_all_button.setEnabled(False)
+        self.show_all_button.clicked.connect(self.toggle_show_all)
+        range_layout.addWidget(self.show_all_button)
+        main_layout.addLayout(range_layout)
+
+        # Scrollable area for plots
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(400)
+        
+        self.plots_widget = QWidget()
+        self.plots_layout = QVBoxLayout()
+        self.plots_widget.setLayout(self.plots_layout)
+        scroll.setWidget(self.plots_widget)
+        main_layout.addWidget(scroll)
+        
+        # Matplotlib figure (will be created dynamically)
+        self.fig = None
+        self.canvas = None
         
         # Frame slider for plot navigation
         slider_row = QHBoxLayout()
@@ -490,7 +532,7 @@ class ExcelPlotWidget(QWidget):
         self.plot_frame_label = QLabel("0")
         self.plot_frame_label.setMinimumWidth(60)
         slider_row.addWidget(self.plot_frame_label)
-        layout.addLayout(slider_row)
+        main_layout.addLayout(slider_row)
 
     def load_excel(self):
         """Open a dialog, load Excel into a DataFrame, populate feature combo."""
@@ -514,16 +556,28 @@ class ExcelPlotWidget(QWidget):
 
         if not numeric_cols:
             self.info_label.setText("Loaded file, but no numeric columns found.")
-            self.feature_combo.clear()
-            self.feature_combo.setEnabled(False)
-            self.ax.clear()
-            self.canvas.draw_idle()
+            self.feature_list.clear()
+            self.feature_list.setEnabled(False)
+            self.toggle_features_button.setEnabled(False)
+            self.range_spinbox.setEnabled(False)
+            self.show_all_button.setEnabled(False)
+            self._clear_plots()
             return
 
         self.info_label.setText(f"Loaded: {path}")
-        self.feature_combo.clear()
-        self.feature_combo.addItems(numeric_cols)
-        self.feature_combo.setEnabled(True)
+        
+        # Populate feature list with checkboxes
+        self.feature_list.clear()
+        for col in numeric_cols:
+            item = QListWidgetItem(col)
+            item.setCheckState(Qt.Unchecked)
+            self.feature_list.addItem(item)
+        self.feature_list.setEnabled(True)
+        self.toggle_features_button.setEnabled(True)
+        
+        # Enable range controls
+        self.range_spinbox.setEnabled(True)
+        self.show_all_button.setEnabled(True)
         
         # Update plot slider range
         if self.plot_slider:
@@ -535,9 +589,9 @@ class ExcelPlotWidget(QWidget):
                 current_video_frame = self.video_widget.frame_slider.value()
                 current_video_frame = max(0, min(current_video_frame, max_frame))
                 self.plot_slider.setValue(current_video_frame)
-
-        # Plot first feature by default
-        self.update_plot(self.feature_combo.currentText())
+        
+        # Clear previous plots
+        self._clear_plots()
 
     def get_current_frame(self):
         """Get current frame index from video widget if available."""
@@ -547,63 +601,162 @@ class ExcelPlotWidget(QWidget):
             self.video_widget.frame_slider is not None):
             return self.video_widget.frame_slider.value()
         return 0
-
-    def update_plot(self, feature_name: str):
-        """Plot feature with ±100 frame zoom around current frame."""
-        if self.df is None or not feature_name:
+    
+    def toggle_features_visibility(self):
+        """Toggle visibility of the feature selection list."""
+        is_visible = self.feature_list.isVisible()
+        self.feature_list.setVisible(not is_visible)
+        self.toggle_features_button.setText("Show" if is_visible else "Hide")
+    
+    def _clear_plots(self):
+        """Clear all plots and remove from layout."""
+        # Remove all widgets from plots layout
+        while self.plots_layout.count():
+            item = self.plots_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.plot_axes = {}
+        self.fig = None
+        self.canvas = None
+    
+    def on_feature_selection_changed(self):
+        """Handle feature selection changes."""
+        if self.df is None:
             return
-
-        self.ax.clear()
+        
+        # Get selected features
+        selected = []
+        for i in range(self.feature_list.count()):
+            item = self.feature_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected.append(item.text())
+        
+        self.selected_features = selected
+        self.update_all_plots()
+    
+    def on_range_changed(self, value):
+        """Handle frame range change."""
+        self.frame_range = value
+        if not self.show_all:
+            self.update_all_plots()
+    
+    def toggle_show_all(self):
+        """Toggle between show all and zoomed view."""
+        self.show_all = not self.show_all
+        if self.show_all:
+            self.show_all_button.setText("Show Zoomed")
+            self.range_spinbox.setEnabled(False)
+        else:
+            self.show_all_button.setText("Show All")
+            self.range_spinbox.setEnabled(True)
+        self.update_all_plots()
+    
+    def update_all_plots(self):
+        """Update all selected feature plots."""
+        if self.df is None or not self.selected_features:
+            self._clear_plots()
+            return
+        
         frame = self.get_current_frame()
         frame = max(0, min(frame, len(self.df) - 1))
         
-        # Get ±100 frame range
-        x_min = max(0, frame - 100)
-        x_max = min(len(self.df) - 1, frame + 100)
+        # Determine x-axis range
+        if self.show_all:
+            x_min = 0
+            x_max = len(self.df) - 1
+        else:
+            x_min = max(0, frame - self.frame_range)
+            x_max = min(len(self.df) - 1, frame + self.frame_range)
         
-        # Plot visible range
-        x = self.df.index[x_min:x_max+1].to_numpy()
-        y = self.df[feature_name].iloc[x_min:x_max+1].to_numpy()
+        # Create figure if needed or if number of features changed
+        num_features = len(self.selected_features)
+        if self.fig is None or len(self.plot_axes) != num_features:
+            self._clear_plots()
+            self.fig = Figure(figsize=(8, 3 * num_features))
+            self.canvas = FigureCanvas(self.fig)
+            self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+            
+            # Create subplots for each feature
+            for i, feature_name in enumerate(self.selected_features):
+                ax = self.fig.add_subplot(num_features, 1, i + 1)
+                self.plot_axes[feature_name] = {
+                    'ax': ax,
+                    'vline': None,
+                    'plot_range': None,
+                    'index': i
+                }
+            
+            self.plots_layout.addWidget(self.canvas)
         
-        self.ax.plot(x, y, 'b-', linewidth=1.5)
-        self.frame_vline = self.ax.axvline(frame, color='r', linestyle="--", linewidth=2)
-        self.ax.set_title(feature_name)
-        self.ax.set_xlabel("Frame")
-        self.ax.set_ylabel(feature_name)
-        self.ax.grid(True, alpha=0.3)
+        # Update each plot
+        for feature_name in self.selected_features:
+            if feature_name not in self.plot_axes:
+                continue
+            
+            ax = self.plot_axes[feature_name]['ax']
+            ax.clear()
+            plot_idx = self.plot_axes[feature_name]['index']
+            
+            # Get data range
+            if self.show_all:
+                plot_x_min = x_min
+                plot_x_max = x_max
+            else:
+                plot_x_min = x_min
+                plot_x_max = x_max
+            
+            # Plot data
+            x = self.df.index[plot_x_min:plot_x_max+1].to_numpy()
+            y = self.df[feature_name].iloc[plot_x_min:plot_x_max+1].to_numpy()
+            
+            ax.plot(x, y, 'b-', linewidth=1.5)
+            vline = ax.axvline(frame, color='r', linestyle="--", linewidth=2)
+            
+            ax.set_title(feature_name)
+            ax.set_xlabel("Frame" if plot_idx == num_features - 1 else "")
+            ax.set_ylabel(feature_name)
+            ax.grid(True, alpha=0.3)
+            
+            # Set x-axis limits
+            padding = (plot_x_max - plot_x_min) * 0.05 if plot_x_max > plot_x_min else 1
+            ax.set_xlim(plot_x_min - padding, plot_x_max + padding)
+            
+            # Auto-scale y-axis
+            valid_y = y[np.isfinite(y)]
+            if len(valid_y) > 0:
+                y_min = valid_y.min()
+                y_max = valid_y.max()
+                if np.isfinite(y_min) and np.isfinite(y_max):
+                    y_padding = (y_max - y_min) * 0.1 if y_max != y_min else abs(y_max) * 0.1 if y_max != 0 else 1
+                    ax.set_ylim(y_min - y_padding, y_max + y_padding)
+            
+            # Store references
+            self.plot_axes[feature_name]['vline'] = vline
+            self.plot_axes[feature_name]['plot_range'] = (plot_x_min, plot_x_max)
         
-        # Set x-axis to ±100 range
-        padding = (x_max - x_min) * 0.05
-        self.ax.set_xlim(x_min - padding, x_max + padding)
-        
-        # Auto-scale y-axis
-        valid_y = y[np.isfinite(y)]
-        if len(valid_y) > 0:
-            y_min = valid_y.min()
-            y_max = valid_y.max()
-            if np.isfinite(y_min) and np.isfinite(y_max):
-                y_padding = (y_max - y_min) * 0.1 if y_max != y_min else abs(y_max) * 0.1 if y_max != 0 else 1
-                self.ax.set_ylim(y_min - y_padding, y_max + y_padding)
-        
-        # Store current plot state for optimization
-        self.current_plot_range = (x_min, x_max)
-        self.current_feature = feature_name
         self.fig.tight_layout()
         self.canvas.draw_idle()
     
     def on_plot_click(self, event):
         """Click plot to navigate video."""
-        if event.inaxes != self.ax or self.df is None:
+        if self.df is None or event.xdata is None:
             return
-        if event.xdata is None:
+        
+        # Check if click is in any of our axes
+        clicked_ax = None
+        for feature_name, plot_data in self.plot_axes.items():
+            if event.inaxes == plot_data['ax']:
+                clicked_ax = plot_data['ax']
+                break
+        
+        if clicked_ax is None:
             return
+        
         clicked_frame = max(0, min(int(round(event.xdata)), len(self.df) - 1))
         # Update both sliders
         if self.plot_slider:
             self.plot_slider.setValue(clicked_frame)
         if self.video_widget and self.video_widget.frame_slider:
-            # Set slider value - this will trigger on_slider_change which updates video and plot
-            # No need to block signals since on_frame_change checks if replot is needed
             self.video_widget.frame_slider.setValue(clicked_frame)
     
     def on_plot_slider_change(self, value):
@@ -645,25 +798,39 @@ class ExcelPlotWidget(QWidget):
             if self.plot_frame_label:
                 self.plot_frame_label.setText(str(frame))
         
-        current_feature = self.feature_combo.currentText()
-        if not current_feature:
+        if not self.selected_features:
             return
         
-        # Check if we need to replot (frame outside current range or feature changed)
+        # Check if we need to replot (frame outside current range or show_all mode)
         need_replot = False
-        if (self.current_plot_range is None or 
-            self.current_feature != current_feature or
-            frame < self.current_plot_range[0] or 
-            frame > self.current_plot_range[1]):
-            need_replot = True
+        if self.show_all:
+            # In show_all mode, just update vertical lines
+            need_replot = False
+        else:
+            # Check if frame is outside any plot's range
+            for feature_name in self.selected_features:
+                if feature_name not in self.plot_axes:
+                    need_replot = True
+                    break
+                plot_range = self.plot_axes[feature_name]['plot_range']
+                if plot_range is None:
+                    need_replot = True
+                    break
+                if frame < plot_range[0] or frame > plot_range[1]:
+                    need_replot = True
+                    break
         
         if need_replot:
             # Full replot with new frame center
-            self.update_plot(current_feature)
+            self.update_all_plots()
         else:
-            # Just update the vertical line position (much faster)
-            if self.frame_vline is not None:
-                self.frame_vline.set_xdata([frame, frame])
+            # Just update the vertical line positions (much faster)
+            if self.canvas and self.fig:
+                for feature_name in self.selected_features:
+                    if feature_name in self.plot_axes:
+                        vline = self.plot_axes[feature_name]['vline']
+                        if vline is not None:
+                            vline.set_xdata([frame, frame])
                 self.canvas.draw_idle()
 
 
