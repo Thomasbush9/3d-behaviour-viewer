@@ -43,13 +43,6 @@ def _(List, re):
 
 
 @app.cell
-def _(features_paths, find_sessions, pd):
-    sessions_m2_cricket = find_sessions(features_paths, condition="cricket", mouse=3)
-    session_m2_cricket_dict = {path.name: pd.read_excel(path) for path in sessions_m2_cricket}
-    return (session_m2_cricket_dict,)
-
-
-@app.cell
 def _(List, plt, session_m2_cricket_dict):
     feature = "head_speed"
     sessions = list(session_m2_cricket_dict.items())
@@ -60,18 +53,18 @@ def _(List, plt, session_m2_cricket_dict):
         n_rows, n_cols = 2, 3
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 6), sharex=True)
         axes = axes.flatten()  # flatten to iterate easily
-    
+
         for ax, (sess_name, sess_data) in zip(axes, sessions):
             sess_data[feature].rolling(5).mean().plot(ax=ax)
             # ax.violin_plot()
             ax.set_ylim(0, 400)
             ax.set_title(sess_name)
             ax.set_ylabel(feature)
-    
+
         # Hide any empty subplots (if fewer sessions than grid cells)
         for ax in axes[n_sessions:]:
             ax.set_visible(False)
-    
+
         axes[-1].set_xlabel("Frame")
         plt.suptitle(f"{feature} across sessions", y=1.02)
         plt.tight_layout()
@@ -107,33 +100,33 @@ def _(List, np, parse_filename, plt, re):
     def plot_violin_sessions(sessions:List, feature_name:str, saving_dir=None, show=True):
         # 1. Sort sessions by the sXXX number
         sorted_sessions = sorted(sessions, key=lambda sess: session_index(sess[0]))
-    
+
         # 2. Build names + data in that order
         names = []
         data = []
         for name, df in sorted_sessions:
             if feature_name not in df.columns:
                 continue
-    
+
             vals = df[feature_name]
             vals = vals.replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
-    
+
             if len(vals) > 0:
                 names.append(name)
                 data.append(vals)
-    
+
         # 3. Plot
         plt.figure()
         plt.violinplot(data, showmeans=True, showextrema=True, showmedians=True)
         plt.ylabel(feature_name)
         plt.title(f"{feature_name} per session")
-    
+
         plt.xticks(
             ticks=range(1, len(names) + 1),
             labels=names,
             rotation=90
         )
-    
+
         plt.tight_layout()
         if saving_dir is not None:
             mouse, condition = parse_filename(names[0])
@@ -156,7 +149,7 @@ def _(plot_violin_sessions, sessions):
 @app.cell
 def _(np, parse_filename, pd, plt, session_index, sns):
     def plot_feature_dev_heatmap(sessions, saving_dir=None, show=True):
-    
+
         angle_cols = [
             "facing_angle",
             "rel_bearing",
@@ -170,7 +163,7 @@ def _(np, parse_filename, pd, plt, session_index, sns):
             "ori_head",
             "omega_theta_trunk",
         ]
-    
+
         non_angle_cols = [
             "dist_head",
             "dist",
@@ -192,7 +185,7 @@ def _(np, parse_filename, pd, plt, session_index, sns):
             "dist_scaled",
             "dist_change_scaled",
         ]
-    
+
         exclude = ["timestamp"]
 
         all_rows = []
@@ -269,7 +262,6 @@ def _(np, parse_filename, pd, plt, session_index, sns):
 
         if show:
             plt.show()
-
     return (plot_feature_dev_heatmap,)
 
 
@@ -291,7 +283,6 @@ def _(Path):
         data = pickle.load(f)
     print(len(data))
 
-
     return data, plot_occupancy
 
 
@@ -302,7 +293,7 @@ def _(data, np, tqdm):
 
     for frame, values in tqdm(data.items()):
         if frame == "metadata":
-            continue 
+            continue
         coordinates.append(values["coordinates"])
         confidences.append(np.asarray(values["confidence"]))
 
@@ -368,7 +359,7 @@ def _(features_paths, parse_filename):
     conditions = ["cricket", "object"]
     for pathname in features_paths:
         if pathname.name == "startTimes.xlsx":
-            continue 
+            continue
         m, condition = parse_filename(pathname.name)
         mice.append(m)
     mice = set(mice)
@@ -392,25 +383,25 @@ def _(
         conditions = ["cricket", "object"]
         for pathname in features_paths:
             if pathname.name == "startTimes.xlsx":
-                continue 
+                continue
             m, condition = parse_filename(pathname.name)
             mice.append(m)
         mice = set(mice)
         # deal with features for the violin plots
         if not feature_list:
             feature_list = ["head_speed", "facing_angle"]
-    
+
         for m in tqdm(mice):
             for condition in conditions:
                 temp_sessions = find_sessions(features_paths, condition, m)
                 temp_dict = {path.name: pd.read_excel(path) for path in temp_sessions}
                 sessions_list = list(temp_dict.items())
                 n_sessions = len(sessions_list)
-    
+
                 for feature_ in feature_list:
                     plot_violin_sessions(sessions_list, feature_, saving_dir, show=False)
                 plot_feature_dev_heatmap(sessions_list, saving_dir, show=False)
-        print("All Plots generated:")        
+        print("All Plots generated:")
     return (generate_and_save_plots,)
 
 
@@ -449,7 +440,7 @@ def _(parse_filename, pd, session_index):
             # parse mouse + condition from filename: m001_s001_cricket.xlsx
             mouse, condition = parse_filename(path.name)  # you already have this
             session_id = session_index(path.name)        # you already have this
-        
+
             df = pd.read_excel(path)
 
             # decide which features to keep
@@ -487,7 +478,7 @@ def _(parse_filename, pd, session_index):
 
 @app.cell
 def _(build_session_level_df, features_paths):
-    feature_list = ["dist_head", "head_speed", "facing_angle"]  # or None for all numeric
+    feature_list = ["dist_head", "head_speed", "facing_angle", "speed_head_fwd", "head_acc", "nose_tail_distance"]  # or None for all numeric
     session_df = build_session_level_df(features_paths, feature_list)
 
     session_df.head()
@@ -495,15 +486,29 @@ def _(build_session_level_df, features_paths):
 
 
 @app.cell
+def _(np, session_df):
+    session_df["cos_facing_angle"] = np.cos(session_df["facing_angle"])
+    return
+
+
+@app.cell
 def _(session_df, smf):
     model = smf.mixedlm(
-        "facing_angle ~ session * condition",
+        "dist_head ~ session * condition",
         data=session_df,
         groups=session_df["mouse"],
     )
     res = model.fit()
     print(res.summary())
     return
+
+
+app._unparsable_cell(
+    r"""
+    !pip install ssm
+    """,
+    name="_"
+)
 
 
 @app.cell
