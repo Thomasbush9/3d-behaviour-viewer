@@ -21,7 +21,7 @@ from qtpy.QtWidgets import (
     QScrollArea,
 )
 from qtpy.QtCore import Qt
-from qtpy.QtGui import QKeyEvent
+from qtpy.QtGui import QKeyEvent, QPainter, QColor
 
 
 class LazyVideoLoader:
@@ -98,6 +98,46 @@ class LazyVideoLoader:
     
     def __del__(self):
         self.close()
+
+
+class EventSliderWidget(QWidget):
+    """Custom widget to display event regions on a slider."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.events_df = None
+        self.max_frame = 0
+        self.setMinimumHeight(10)
+        self.setMaximumHeight(10)
+    
+    def set_events(self, events_df, max_frame):
+        """Set events data and maximum frame."""
+        self.events_df = events_df
+        self.max_frame = max_frame
+        self.update()
+    
+    def paintEvent(self, event):
+        """Paint event regions as red rectangles."""
+        if self.events_df is None or len(self.events_df) == 0 or self.max_frame == 0:
+            return
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        width = self.width()
+        height = self.height()
+        
+        # Draw red rectangles for each event
+        painter.setBrush(QColor(255, 0, 0, 76))  # Red with alpha ~0.3
+        painter.setPen(Qt.NoPen)
+        
+        for _, event_row in self.events_df.iterrows():
+            start_frame = event_row['start_frame']
+            end_frame = event_row['end_frame']
+            
+            if self.max_frame > 0:
+                x_start = (start_frame / self.max_frame) * width
+                x_end = (end_frame / self.max_frame) * width
+                painter.drawRect(int(x_start), 0, int(x_end - x_start), height)
 
 
 class VideoLoaderWidget(QWidget):
@@ -648,6 +688,7 @@ class ExcelPlotWidget(QWidget):
         self.plot_axes = {}  # Dict: feature_name -> (ax, frame_vline, plot_range)
         self.plot_slider = None  # Slider for plot navigation
         self.feature_y_limits = {}  # Store fixed y-axis limits for each feature
+        self.events_df = None  # Store events CSV data
 
         # --- Layout ---
         main_layout = QVBoxLayout()
@@ -657,6 +698,11 @@ class ExcelPlotWidget(QWidget):
         self.load_button = QPushButton("Load Excel file...")
         self.load_button.clicked.connect(self.load_excel)
         main_layout.addWidget(self.load_button)
+        
+        # Button: load events CSV
+        self.load_events_button = QPushButton("Load Events CSV...")
+        self.load_events_button.clicked.connect(self.load_events_csv)
+        main_layout.addWidget(self.load_events_button)
 
         # Info label
         self.info_label = QLabel("No file loaded.")
@@ -713,6 +759,7 @@ class ExcelPlotWidget(QWidget):
         self.canvas = None
         
         # Frame slider for plot navigation
+        slider_container = QVBoxLayout()
         slider_row = QHBoxLayout()
         self.plot_slider_label = QLabel("Frame:")
         slider_row.addWidget(self.plot_slider_label)
@@ -731,7 +778,56 @@ class ExcelPlotWidget(QWidget):
         self.plot_frame_label = QLabel("0")
         self.plot_frame_label.setMinimumWidth(80)
         slider_row.addWidget(self.plot_frame_label)
-        main_layout.addLayout(slider_row)
+        slider_container.addLayout(slider_row)
+        
+        # Event indicator widget below slider
+        self.event_slider_widget = EventSliderWidget()
+        slider_container.addWidget(self.event_slider_widget)
+        main_layout.addLayout(slider_container)
+
+    def load_events_csv(self):
+        """Load CSV file with events (index, start_frame, end_frame, duration)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Events CSV file",
+            "",
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if not path:
+            return
+        
+        try:
+            self.events_df = pd.read_csv(path)
+            # Validate required columns
+            required_cols = ['index', 'start_frame', 'end_frame', 'duration']
+            if not all(col in self.events_df.columns for col in required_cols):
+                self.info_label.setText(f"CSV must have columns: {', '.join(required_cols)}")
+                self.events_df = None
+                return
+            
+            # Convert to numeric
+            for col in ['start_frame', 'end_frame', 'duration']:
+                self.events_df[col] = pd.to_numeric(self.events_df[col], errors='coerce')
+            
+            # Remove rows with invalid data
+            self.events_df = self.events_df.dropna(subset=['start_frame', 'end_frame'])
+            
+            self.info_label.setText(f"Loaded events: {len(self.events_df)} events")
+            
+            # Update event slider widget
+            if self.df is not None:
+                max_frame = len(self.df) - 1
+                self.event_slider_widget.set_events(self.events_df, max_frame)
+            elif self.video_widget and hasattr(self.video_widget, 'num_frames'):
+                max_frame = self.video_widget.num_frames - 1
+                self.event_slider_widget.set_events(self.events_df, max_frame)
+            
+            # Update plots if they exist
+            if self.selected_features:
+                self.update_all_plots(force_replot=True)
+        except Exception as e:
+            self.info_label.setText(f"Error loading events CSV: {str(e)}")
+            self.events_df = None
 
     def load_excel(self):
         """Open a dialog, load Excel into a DataFrame, populate feature combo."""
@@ -788,6 +884,10 @@ class ExcelPlotWidget(QWidget):
                 current_video_frame = self.video_widget.frame_slider.value()
                 current_video_frame = max(0, min(current_video_frame, max_frame))
                 self.plot_slider.setValue(current_video_frame)
+        
+        # Update event slider widget if events are loaded
+        if self.events_df is not None:
+            self.event_slider_widget.set_events(self.events_df, max_frame)
         
         # Clear previous plots
         self._clear_plots()
@@ -957,6 +1057,26 @@ class ExcelPlotWidget(QWidget):
                 # Plot the line (store reference for smooth updates)
                 line, = ax.plot(x_all, y_all, 'b-', linewidth=1.5)
                 self.plot_axes[feature_name]['line'] = line
+                
+                # Add event regions (red shaded areas)
+                if self.events_df is not None and len(self.events_df) > 0:
+                    for _, event in self.events_df.iterrows():
+                        start_frame = event['start_frame']
+                        end_frame = event['end_frame']
+                        
+                        # Convert to time if needed
+                        if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
+                            if hasattr(self.video_widget, 'frame_to_time'):
+                                start_x = self.video_widget.frame_to_time(start_frame)
+                                end_x = self.video_widget.frame_to_time(end_frame)
+                            else:
+                                start_x = start_frame
+                                end_x = end_frame
+                        else:
+                            start_x = start_frame
+                            end_x = end_frame
+                        
+                        ax.axvspan(start_x, end_x, alpha=0.3, color='red', zorder=0)
                 
                 # Add vertical line
                 if self.video_widget and hasattr(self.video_widget, 'show_time') and self.video_widget.show_time:
